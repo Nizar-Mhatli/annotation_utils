@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import List
 import json
 import cv2
+from tqdm import tqdm
 
 from common_utils.check_utils import check_file_exists, check_required_keys, check_dir_exists, check_file_exists
 from common_utils.common_types.bbox import BBox
@@ -101,7 +102,7 @@ class DigitGroupList(BaseStructHandler['DigitGroupList', 'DigitGroup']):
         json_data = json.load(open(json_path, 'r'))
         return DigitGroupList.from_dict_list(json_data)
 
-    def to_coco(self, img_dir: str) -> COCO_Dataset:
+    def to_coco(self, img_dir: str, show_pbar: bool=True) -> COCO_Dataset:
         check_dir_exists(img_dir)
 
         # Initialize Handlers
@@ -116,22 +117,80 @@ class DigitGroupList(BaseStructHandler['DigitGroupList', 'DigitGroup']):
             COCO_License(url='N/A', id=0, name='Free License')
         )
 
+        pbar = tqdm(total=len(self), unit='image(s)') if show_pbar else None
+        if pbar is not None:
+            pbar.set_description('Converting to COCO...')
         for group in self:
             img_filename = group.filename
             img_path = f'{img_dir}/{img_filename}'
             check_file_exists(img_path)
             img = cv2.imread(img_path)
             img_h, img_w = img.shape[:2]
+            image_id = len(images)
             coco_image = COCO_Image.from_img_path(
                 img_path=img_path,
                 license_id=0,
-                image_id=len(images)
+                image_id=image_id
             )
             images.append(coco_image)
+            bbox_list = []
             for digit in group.digits:
                 bbox = digit.bbox
-                label = digit.label
-                raise NotImplementedError # TODO
+                bbox_list.append(bbox)
+                
+                # Test
+                bbox_h, bbox_w = bbox.shape()
+                if bbox_h == 0 or bbox_w == 0:
+                    logger.error(f'Encountered bbox with zero area.')
+                    logger.error(f'bbox: {bbox}')
+                    raise Exception
+
+                label = str(int(float(digit.label)))
+
+                if label not in [coco_cat.name for coco_cat in categories]:
+                    categories.append(
+                        COCO_Category(
+                            id=len(categories),
+                            supercategory=label,
+                            name=label
+                        )
+                    )
+                coco_cat = categories.get_unique_category_from_name(label)
+                annotations.append(
+                    COCO_Annotation(
+                        id=len(annotations),
+                        category_id=coco_cat.id,
+                        image_id=image_id,
+                        bbox=bbox,
+                        area=bbox.area()
+                    )
+                )
+            if 'whole_number' not in [coco_cat.name for coco_cat in categories]:
+                categories.append(
+                    COCO_Category(
+                        id=len(categories),
+                        supercategory='whole_number',
+                        name='whole_number'
+                    )
+                )
+            coco_cat = categories.get_unique_category_from_name('whole_number')
+            bbox0_xmin = min([seg_bbox.xmin for seg_bbox in bbox_list])
+            bbox0_ymin = min([seg_bbox.ymin for seg_bbox in bbox_list])
+            bbox0_xmax = max([seg_bbox.xmax for seg_bbox in bbox_list])
+            bbox0_ymax = max([seg_bbox.ymax for seg_bbox in bbox_list])
+            result_bbox = BBox(xmin=bbox0_xmin, ymin=bbox0_ymin, xmax=bbox0_xmax, ymax=bbox0_ymax)
+            annotations.append(
+                COCO_Annotation(
+                    id=len(annotations),
+                    category_id=coco_cat.id,
+                    image_id=image_id,
+                    bbox=result_bbox,
+                    area=result_bbox.area()
+                )
+            )
+
+            if pbar is not None:
+                pbar.update(1)
 
         # Construct COCO Dataset
         dataset = COCO_Dataset(
@@ -147,4 +206,8 @@ from logger import logger
 ann_path = 'data/digitStruct.json'
 img_dir = 'data/images'
 digit_groups = DigitGroupList.load_from_path(ann_path)
-logger.purple(digit_groups)
+dataset = digit_groups.to_coco(img_dir=img_dir, show_pbar=True)
+dataset.save_to_path(save_path='output.json', overwrite=True)
+
+dataset = COCO_Dataset.load_from_path(json_path='output.json')
+dataset.display_preview(bbox_label_thickness=1)
